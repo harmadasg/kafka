@@ -291,6 +291,16 @@ public abstract class AbstractResponse implements AbstractRequestResponse {
                 return AlterShareGroupOffsetsResponse.parse(readable, version);
             case DELETE_SHARE_GROUP_OFFSETS:
                 return DeleteShareGroupOffsetsResponse.parse(readable, version);
+            case CREATE_VIRTUAL_CLUSTER:
+                return CreateVirtualClusterResponse.parse(readable, version);
+            case DELETE_VIRTUAL_CLUSTER:
+                return DeleteVirtualClusterResponse.parse(readable, version);
+            case ALTER_VIRTUAL_CLUSTER:
+                return AlterVirtualClusterResponse.parse(readable, version);
+            case LIST_VIRTUAL_CLUSTER:
+                return ListVirtualClustersResponse.parse(readable, version);
+            case DESCRIBE_VIRTUAL_CLUSTER:
+                return DescribeVirtualClusterResponse.parse(readable, version);
             default:
                 throw new AssertionError(String.format("ApiKey %s is not currently handled in `parseResponse`, the " +
                         "code should be updated to do so.", apiKey));

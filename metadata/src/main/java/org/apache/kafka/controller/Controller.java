@@ -28,6 +28,7 @@ import org.apache.kafka.common.message.AlterPartitionRequestData;
 import org.apache.kafka.common.message.AlterPartitionResponseData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsRequestData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsResponseData;
+import org.apache.kafka.common.message.AlterVirtualClusterRequestData.AlterableVirtualCluster;
 import org.apache.kafka.common.message.AssignReplicasToDirsRequestData;
 import org.apache.kafka.common.message.AssignReplicasToDirsResponseData;
 import org.apache.kafka.common.message.BrokerHeartbeatRequestData;
@@ -52,6 +53,7 @@ import org.apache.kafka.common.message.UpdateFeaturesResponseData;
 import org.apache.kafka.common.quota.ClientQuotaAlteration;
 import org.apache.kafka.common.quota.ClientQuotaEntity;
 import org.apache.kafka.common.requests.ApiError;
+import org.apache.kafka.common.metadata.VirtualClusterRecord;
 import org.apache.kafka.metadata.BrokerHeartbeatReply;
 import org.apache.kafka.metadata.BrokerRegistrationReply;
 import org.apache.kafka.metadata.FinalizedControllerFeatures;
@@ -417,6 +419,64 @@ public interface Controller extends AclMutator, AutoCloseable {
     CompletableFuture<AssignReplicasToDirsResponseData> assignReplicasToDirs(
         ControllerRequestContext context,
         AssignReplicasToDirsRequestData request
+    );
+
+    /**
+     * Create a virtual cluster with the given name.
+     *
+     * @param context   The controller request context.
+     * @param name      The name of the virtual cluster to create.
+     * @return          A future that completes when the virtual cluster has been created.
+     */
+    CompletableFuture<Void> createVirtualCluster(
+        ControllerRequestContext context,
+        String name
+    );
+
+    /**
+     * Delete a virtual cluster with the given name.
+     *
+     * @param context   The controller request context.
+     * @param name      The name of the virtual cluster to delete.
+     * @return          A future that completes when the virtual cluster has been deleted.
+     */
+    CompletableFuture<Void> deleteVirtualCluster(
+        ControllerRequestContext context,
+        String name
+    );
+
+    /**
+     * Alter a virtual cluster by adding or removing resources.
+     *
+     * @param context   The controller request context.
+     * @param data      The alter request data (name, resources list) for a single virtual cluster.
+     * @return          A future that completes when the virtual cluster has been altered.
+     */
+    CompletableFuture<Void> alterVirtualCluster(
+        ControllerRequestContext context,
+        AlterableVirtualCluster data
+    );
+
+    /**
+     * List all virtual clusters.
+     *
+     * @param context   The controller request context.
+     * @return          A future that yields the list of virtual cluster names.
+     */
+    CompletableFuture<List<String>> listVirtualClusters(
+        ControllerRequestContext context
+    );
+
+    /**
+     * Describe a virtual cluster.
+     *
+     * @param context   The controller request context.
+     * @param name      The name of the virtual cluster to describe.
+     * @return          A future that yields the VirtualClusterRecord for the named cluster.
+     */
+    CompletableFuture<VirtualClusterRecord> describeVirtualCluster(
+        ControllerRequestContext context,
+        String name
     );
 
     /**

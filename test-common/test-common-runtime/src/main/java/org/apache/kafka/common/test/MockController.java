@@ -32,6 +32,7 @@ import org.apache.kafka.common.message.AlterPartitionRequestData;
 import org.apache.kafka.common.message.AlterPartitionResponseData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsRequestData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsResponseData;
+import org.apache.kafka.common.message.AlterVirtualClusterRequestData.AlterableVirtualCluster;
 import org.apache.kafka.common.message.AssignReplicasToDirsRequestData;
 import org.apache.kafka.common.message.AssignReplicasToDirsResponseData;
 import org.apache.kafka.common.message.BrokerHeartbeatRequestData;
@@ -75,6 +76,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import org.apache.kafka.common.metadata.VirtualClusterRecord;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -543,6 +545,31 @@ public class MockController implements Controller {
 
     @Override
     public CompletableFuture<AssignReplicasToDirsResponseData> assignReplicasToDirs(ControllerRequestContext context, AssignReplicasToDirsRequestData request) {
+        throw new java.lang.UnsupportedOperationException("not implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> createVirtualCluster(ControllerRequestContext context, String name) {
+        throw new java.lang.UnsupportedOperationException("not implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteVirtualCluster(ControllerRequestContext context, String name) {
+        throw new java.lang.UnsupportedOperationException("not implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> alterVirtualCluster(ControllerRequestContext context, AlterableVirtualCluster data) {
+        throw new java.lang.UnsupportedOperationException("not implemented");
+    }
+
+    @Override
+    public CompletableFuture<List<String>> listVirtualClusters(ControllerRequestContext context) {
+        throw new java.lang.UnsupportedOperationException("not implemented");
+    }
+
+    @Override
+    public CompletableFuture<VirtualClusterRecord> describeVirtualCluster(ControllerRequestContext context, String name) {
         throw new java.lang.UnsupportedOperationException("not implemented");
     }
 }

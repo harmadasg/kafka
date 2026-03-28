@@ -1,0 +1,53 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+{
+  "apiKey": 31,
+  "type": "metadata",
+  "name": "VirtualClusterChangeRecord",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "fields": [
+    { "name": "Name", "type": "string", "versions": "0+",
+      "about": "The name of the virtual cluster being changed." },
+    { "name": "AddedTopics", "type": "[]VirtualClusterTopicLink", "versions": "0+",
+      "about": "Topic links added to this virtual cluster.",
+      "fields": [
+        { "name": "TopicName", "type": "string", "versions": "0+",
+          "about": "The physical topic name." },
+        { "name": "LinkName", "type": "string", "versions": "0+",
+          "about": "The link name within the virtual cluster." }
+      ]
+    },
+    { "name": "RemovedTopics", "type": "[]string", "versions": "0+",
+      "about": "Physical topic names of topic links removed from this virtual cluster." },
+    { "name": "AddedUsers", "type": "[]string", "versions": "0+",
+      "about": "Users added to this virtual cluster." },
+    { "name": "RemovedUsers", "type": "[]string", "versions": "0+",
+      "about": "Users removed from this virtual cluster." },
+    { "name": "AddedClients", "type": "[]string", "versions": "0+",
+      "about": "Clients added to this virtual cluster." },
+    { "name": "RemovedClients", "type": "[]string", "versions": "0+",
+      "about": "Clients removed from this virtual cluster." },
+    { "name": "AddedGroups", "type": "[]string", "versions": "0+",
+      "about": "Consumer groups added to this virtual cluster." },
+    { "name": "RemovedGroups", "type": "[]string", "versions": "0+",
+      "about": "Consumer groups removed from this virtual cluster." },
+    { "name": "AddedTransactionalIds", "type": "[]string", "versions": "0+",
+      "about": "Transactional IDs added to this virtual cluster." },
+    { "name": "RemovedTransactionalIds", "type": "[]string", "versions": "0+",
+      "about": "Transactional IDs removed from this virtual cluster." }
+  ]
+}

@@ -46,7 +46,6 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-
 public interface MetadataCache extends ConfigRepository {
 
     /**
@@ -122,6 +121,79 @@ public interface MetadataCache extends ConfigRepository {
     DescribeClientQuotasResponseData describeClientQuotas(DescribeClientQuotasRequestData request);
 
     DescribeUserScramCredentialsResponseData describeScramCredentials(DescribeUserScramCredentialsRequestData request);
+
+    /**
+     * Resolve a topic name for the given principal on the request path.
+     * <p>
+     * If the principal belongs to a virtual cluster and {@code requestedName} matches a link name
+     * in that VC, the physical topic name is returned. Otherwise {@code requestedName} is returned
+     * unchanged (backward-compatible default for non-VC and non-KRaft caches).
+     */
+    default String resolveTopicName(String principal, String requestedName) {
+        return requestedName;
+    }
+
+    /**
+     * Translate a physical topic name back to its link name for the given principal on the response path.
+     * <p>
+     * If the principal belongs to a virtual cluster and {@code physicalName} matches a topic link in
+     * that VC, the link name is returned. Otherwise {@code physicalName} is returned unchanged.
+     */
+    default String linkNameForTopic(String principal, String physicalName) {
+        return physicalName;
+    }
+
+    /**
+     * Return the set of link names that belong to the virtual cluster of the given principal.
+     * <p>
+     * Used when a VC user requests all topics: they should only see the link names of their own VC,
+     * not all physical topics. Returns an empty set for non-VC principals (default behaviour).
+     */
+    default Set<String> getVcTopicLinkNames(String principal) {
+        return Set.of();
+    }
+
+    /**
+     * Return {@code true} if any virtual cluster has a topic link pointing to the given physical
+     * topic name. Returns {@code false} for non-VC / non-KRaft caches (default behaviour).
+     */
+    default boolean isTopicLinkedInAnyVc(String physicalName) {
+        return false;
+    }
+
+    /**
+     * Resolve a local consumer group ID to its physical (VC-prefixed) form.
+     * Non-VC principals get the name back unchanged (default behaviour).
+     */
+    default String resolveGroupId(String principal, String localGroupId) {
+        return localGroupId;
+    }
+
+    /**
+     * Strip the VC prefix from a physical group ID, returning the local (client-visible) name.
+     * Non-VC principals get the name back unchanged (default behaviour).
+     */
+    default String localGroupId(String principal, String physicalGroupId) {
+        return physicalGroupId;
+    }
+
+    /**
+     * Return {@code true} if the given physical group ID belongs to the VC of the specified user.
+     * Used by ListGroups to filter results to only the caller's VC. Returns {@code false} for
+     * non-VC / non-KRaft caches (default behaviour).
+     */
+    default boolean isGroupInVc(String principal, String physicalGroupId) {
+        return false;
+    }
+
+    /**
+     * Return the name of the virtual cluster the given principal belongs to, or
+     * {@link java.util.Optional#empty()} if the principal is not a VC user.
+     * Default implementation always returns empty (non-VC / non-KRaft caches).
+     */
+    default java.util.Optional<String> getVcName(String principal) {
+        return java.util.Optional.empty();
+    }
 
     /**
      * Get the topic metadata for the given topics.

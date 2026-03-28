@@ -706,6 +706,31 @@ public class MockAdminClient extends AdminClient {
     }
 
     @Override
+    public CreateVirtualClustersResult createVirtualClusters(Collection<NewVirtualCluster> newVirtualClusters, CreateVirtualClusterOptions options) {
+        throw new UnsupportedOperationException("Not implemented in mock");
+    }
+
+    @Override
+    public DeleteVirtualClustersResult deleteVirtualClusters(Collection<String> virtualClusterNames, DeleteVirtualClusterOptions options) {
+        throw new UnsupportedOperationException("Not implemented in mock");
+    }
+
+    @Override
+    public AlterVirtualClustersResult alterVirtualClusters(Collection<VirtualClusterAlteration> alterations, AlterVirtualClusterOptions options) {
+        throw new UnsupportedOperationException("Not implemented in mock");
+    }
+
+    @Override
+    public ListVirtualClustersResult listVirtualClusters() {
+        throw new UnsupportedOperationException("Not implemented in mock");
+    }
+
+    @Override
+    public DescribeVirtualClustersResult describeVirtualClusters(Collection<String> virtualClusterNames, DescribeVirtualClusterOptions options) {
+        throw new UnsupportedOperationException("Not implemented in mock");
+    }
+
+    @Override
     public synchronized DescribeDelegationTokenResult describeDelegationToken(DescribeDelegationTokenOptions options) {
         KafkaFutureImpl<List<DelegationToken>> future = new KafkaFutureImpl<>();
 

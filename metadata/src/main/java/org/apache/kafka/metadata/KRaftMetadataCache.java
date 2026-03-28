@@ -38,6 +38,7 @@ import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.image.TopicImage;
+import org.apache.kafka.image.VirtualClusterImage;
 import org.apache.kafka.server.common.FinalizedFeatures;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
@@ -488,6 +489,126 @@ public class KRaftMetadataCache implements MetadataCache {
 
     public MetadataImage getImage() {
         return currentImage;
+    }
+
+    /**
+     * Resolve a topic name for a given principal on the request path.
+     * <p>
+     * If the principal belongs to a virtual cluster and the requested name matches a link name
+     * in that VC, the corresponding physical topic name is returned. Otherwise the requested
+     * name is returned unchanged (backward-compatible for non-VC clients).
+     */
+    @Override
+    public String resolveTopicName(String principal, String requestedName) {
+        MetadataImage image = currentImage;
+        Optional<VirtualClusterImage> vc = image.virtualClusters().findVcForUser(principal);
+        if (vc.isEmpty()) {
+            // Not a VC user — pass the name through unchanged.
+            return requestedName;
+        }
+        // VC user: only allow names that are registered links; anything else is invisible.
+        return vc.get().topics().stream()
+            .filter(link -> link.linkName().equals(requestedName))
+            .map(VirtualClusterImage.TopicLink::topicName)
+            .findFirst()
+            .orElse("");
+    }
+
+    /**
+     * Translate a physical topic name back to its link name for a given principal on the response path.
+     * <p>
+     * If the principal belongs to a virtual cluster and the physical name matches a topic link in
+     * that VC, the link name is returned. Otherwise the physical name is returned unchanged.
+     */
+    @Override
+    public String linkNameForTopic(String principal, String physicalName) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters()
+            .findVcForUser(principal)
+            .flatMap(vc -> vc.topics().stream()
+                .filter(link -> link.topicName().equals(physicalName))
+                .map(VirtualClusterImage.TopicLink::linkName)
+                .findFirst())
+            .orElse(physicalName);
+    }
+
+    /**
+     * Return the set of link names belonging to the virtual cluster of the given principal.
+     * Returns an empty set when the principal is not assigned to any VC.
+     */
+    @Override
+    public Set<String> getVcTopicLinkNames(String principal) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters()
+            .findVcForUser(principal)
+            .map(vc -> vc.topics().stream()
+                .map(VirtualClusterImage.TopicLink::linkName)
+                .collect(java.util.stream.Collectors.toSet()))
+            .orElse(Set.of());
+    }
+
+    /**
+     * Resolve a local consumer group ID to its physical (prefixed) form for a VC user.
+     * Non-VC users get the name back unchanged.
+     * Format: {@code vcName.localGroupId}
+     */
+    @Override
+    public String resolveGroupId(String principal, String localGroupId) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters().findVcForUser(principal)
+            .map(vc -> vc.name() + "." + localGroupId)
+            .orElse(localGroupId);
+    }
+
+    /**
+     * Strip the VC prefix from a physical group ID, returning the local name.
+     * Non-VC users, or physical IDs that don't start with the expected prefix, are returned unchanged.
+     */
+    @Override
+    public String localGroupId(String principal, String physicalGroupId) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters().findVcForUser(principal)
+            .map(vc -> {
+                String prefix = vc.name() + ".";
+                return physicalGroupId.startsWith(prefix)
+                    ? physicalGroupId.substring(prefix.length())
+                    : physicalGroupId;
+            })
+            .orElse(physicalGroupId);
+    }
+
+    /**
+     * Return {@code true} if the given physical group ID belongs to the VC of the specified user.
+     * Used by ListGroups to filter results to only the caller's VC.
+     */
+    @Override
+    public boolean isGroupInVc(String principal, String physicalGroupId) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters().findVcForUser(principal)
+            .map(vc -> physicalGroupId.startsWith(vc.name() + "."))
+            .orElse(false);
+    }
+
+    /**
+     * Return the name of the virtual cluster the given principal belongs to, or empty if not a VC user.
+     */
+    @Override
+    public java.util.Optional<String> getVcName(String principal) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters().findVcForUser(principal)
+            .map(vc -> vc.name());
+    }
+
+    /**
+     * Return {@code true} if any virtual cluster has a topic link pointing to the given physical
+     * topic name. Used by the delete-topic guard to prevent deletion of VC-linked topics.
+     */
+    @Override
+    public boolean isTopicLinkedInAnyVc(String physicalName) {
+        MetadataImage image = currentImage;
+        return image.virtualClusters().virtualClusterImages().values().stream()
+            .anyMatch(vc -> vc.topics().stream()
+                .anyMatch(link -> link.topicName().equals(physicalName)));
     }
 
     @Override

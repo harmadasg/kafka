@@ -247,6 +247,11 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.DELETE_SHARE_GROUP_OFFSETS => handleDeleteShareGroupOffsetsRequest(request).exceptionally(handleError)
         case ApiKeys.STREAMS_GROUP_DESCRIBE => handleStreamsGroupDescribe(request).exceptionally(handleError)
         case ApiKeys.STREAMS_GROUP_HEARTBEAT => handleStreamsGroupHeartbeat(request).exceptionally(handleError)
+        case ApiKeys.CREATE_VIRTUAL_CLUSTER => forwardToController(request)
+        case ApiKeys.DELETE_VIRTUAL_CLUSTER => forwardToController(request)
+        case ApiKeys.ALTER_VIRTUAL_CLUSTER => forwardToController(request)
+        case ApiKeys.LIST_VIRTUAL_CLUSTER => forwardToController(request)
+        case ApiKeys.DESCRIBE_VIRTUAL_CLUSTER => forwardToController(request)
         case _ => throw new IllegalStateException(s"No handler for request api key ${request.header.apiKey}")
       }
     } catch {
@@ -276,6 +281,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestLocal: RequestLocal
   ): CompletableFuture[Unit] = {
     val offsetCommitRequest = request.body[OffsetCommitRequest]
+    val principal = request.context.principal.getName
 
     // Reject the request if not authorized to the group.
     if (!authHelper.authorize(request.context, READ, GROUP, offsetCommitRequest.data.groupId)) {
@@ -287,6 +293,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (useTopicIds) {
         offsetCommitRequest.data.topics.forEach { topic =>
           metadataCache.getTopicName(topic.topicId).ifPresent(name => topic.setName(name))
+        }
+      }
+
+      // Request path: translate link names → physical names in-place for VC users.
+      if (!useTopicIds) {
+        offsetCommitRequest.data.topics.forEach { topic =>
+          topic.setName(metadataCache.resolveTopicName(principal, topic.name))
         }
       }
 
@@ -350,13 +363,15 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       if (authorizedTopicsRequest.isEmpty) {
-        requestHelper.sendMaybeThrottle(request, responseBuilder.build())
+        val builtResponse = responseBuilder.build()
+        if (!useTopicIds) builtResponse.data.topics.forEach { t => t.setName(metadataCache.linkNameForTopic(principal, t.name)) }
+        requestHelper.sendMaybeThrottle(request, builtResponse)
         CompletableFuture.completedFuture(())
       } else {
         groupCoordinator.commitOffsets(
           request.context,
           new OffsetCommitRequestData()
-            .setGroupId(offsetCommitRequest.data.groupId)
+            .setGroupId(metadataCache.resolveGroupId(principal, offsetCommitRequest.data.groupId))
             .setMemberId(offsetCommitRequest.data.memberId)
             .setGenerationIdOrMemberEpoch(offsetCommitRequest.data.generationIdOrMemberEpoch)
             .setRetentionTimeMs(offsetCommitRequest.data.retentionTimeMs)
@@ -367,7 +382,10 @@ class KafkaApis(val requestChannel: RequestChannel,
           if (exception != null) {
             requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(exception))
           } else {
-            requestHelper.sendMaybeThrottle(request, responseBuilder.merge(results).build())
+            val builtResponse = responseBuilder.merge(results).build()
+            // Response path: translate physical names back to link names for VC users (name-based versions only).
+            if (!useTopicIds) builtResponse.data.topics.forEach { t => t.setName(metadataCache.linkNameForTopic(principal, t.name)) }
+            requestHelper.sendMaybeThrottle(request, builtResponse)
           }
         }
       }
@@ -396,6 +414,7 @@ class KafkaApis(val requestChannel: RequestChannel,
    */
   def handleProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val produceRequest = request.body[ProduceRequest]
+    val principal = request.context.principal.getName
 
     if (RequestUtils.hasTransactionalRecords(produceRequest)) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
@@ -415,7 +434,9 @@ class KafkaApis(val requestChannel: RequestChannel,
     produceRequest.data.topicData.forEach { topic =>
       topic.partitionData.forEach { partition =>
         val (topicName, topicId) = if (topic.topicId().equals(Uuid.ZERO_UUID)) {
-          (topic.name(), metadataCache.getTopicId(topic.name()))
+          // Translate link name → physical name for VC users; identity for non-VC users
+          val physical = metadataCache.resolveTopicName(principal, topic.name())
+          (physical, metadataCache.getTopicId(physical))
         } else {
           (metadataCache.getTopicName(topic.topicId).orElse(topic.name), topic.topicId())
         }
@@ -525,7 +546,13 @@ class KafkaApis(val requestChannel: RequestChannel,
           requestHelper.sendNoOpResponseExemptThrottle(request)
         }
       } else {
-        requestChannel.sendResponse(request, new ProduceResponse(mergedResponseStatus.asJava, maxThrottleTimeMs, nodeEndpoints.values.toList.asJava), None)
+        // Response path: translate physical topic names back to link names for VC users.
+        // Logs above keep physical names for debuggability; only the wire response is renamed.
+        val responseStatus = mergedResponseStatus.map { case (tip, status) =>
+          val linkName = metadataCache.linkNameForTopic(principal, tip.topic)
+          new TopicIdPartition(tip.topicId, new TopicPartition(linkName, tip.partition)) -> status
+        }
+        requestChannel.sendResponse(request, new ProduceResponse(responseStatus.asJava, maxThrottleTimeMs, nodeEndpoints.values.toList.asJava), None)
       }
     }
 
@@ -565,9 +592,16 @@ class KafkaApis(val requestChannel: RequestChannel,
     val versionId = request.header.apiVersion
     val clientId = request.header.clientId
     val fetchRequest = request.body[FetchRequest]
+    val principal = request.context.principal.getName
+
+    // For v13+ fetch, topics are identified by UUID. Translate the id→name map so that the
+    // TopicIdPartition objects (and ultimately the FetchResponse) carry link names for VC users.
+    // For v12 and below the map is empty and names come in directly from the request.
     val topicNames =
       if (fetchRequest.version() >= 13)
-        metadataCache.topicIdsToNames()
+        metadataCache.topicIdsToNames().asScala.map { case (id, name) =>
+          id -> metadataCache.linkNameForTopic(principal, name)
+        }.asJava
       else
         Collections.emptyMap[Uuid, String]()
 
@@ -584,6 +618,10 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
     val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
+    // For v12- name-based fetch: map physical TopicIdPartition → link-named TopicIdPartition so we
+    // can rename the response keys back to link names after the ReplicaManager returns.
+    val physicalToLinkTip = mutable.Map[TopicIdPartition, TopicIdPartition]()
+
     if (fetchRequest.isFromFollower) {
       // The follower must have ClusterAction on ClusterResource in order to fetch partition data.
       if (authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
@@ -613,10 +651,30 @@ class KafkaApis(val requestChannel: RequestChannel,
       partitionDatas.foreach { case (topicIdPartition, data) =>
         if (!authorizedTopics.contains(topicIdPartition.topic))
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
-        else if (!metadataCache.contains(topicIdPartition.topicPartition))
-          erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
-        else
-          interesting += topicIdPartition -> data
+        else {
+          // For v12- name-based fetch, topicIdPartition.topic may be a VC link name.
+          // Resolve it to the physical name for the contains-check and ReplicaManager dispatch.
+          // For v13+ topic-ID-based fetch the topicNames map already carries link names; use the
+          // topicId to retrieve the physical name for the contains-check.
+          val physicalName =
+            if (fetchRequest.version() >= 13)
+              OptionConverters.toScala(metadataCache.getTopicName(topicIdPartition.topicId))
+                .getOrElse(topicIdPartition.topic)
+            else
+              metadataCache.resolveTopicName(principal, topicIdPartition.topic)
+          val physicalTip =
+            if (physicalName == topicIdPartition.topic) topicIdPartition
+            else new TopicIdPartition(topicIdPartition.topicId,
+              new TopicPartition(physicalName, topicIdPartition.partition))
+          if (!metadataCache.contains(physicalTip.topicPartition))
+            erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+          else {
+            // Dispatch with the physical name; remember the link name for response renaming (v12- only)
+            if (physicalTip ne topicIdPartition)
+              physicalToLinkTip(physicalTip) = topicIdPartition
+            interesting += physicalTip -> data
+          }
+        }
       }
     }
 
@@ -640,9 +698,12 @@ class KafkaApis(val requestChannel: RequestChannel,
       responsePartitionData.foreach { case (topicIdPartition, data) =>
         val abortedTransactions = data.abortedTransactions.orElse(null)
         val lastStableOffset: Long = data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
-        if (data.isReassignmentFetch) reassigningPartitions.add(topicIdPartition)
+        // For v12- name-based fetch: translate physical tip back to link-named tip for the response.
+        // For v13+ the topicNames map already carried link names so no rename is needed here.
+        val responseTip = physicalToLinkTip.getOrElse(topicIdPartition, topicIdPartition)
+        if (data.isReassignmentFetch) reassigningPartitions.add(responseTip)
         val partitionData = new FetchResponseData.PartitionData()
-          .setPartitionIndex(topicIdPartition.partition)
+          .setPartitionIndex(responseTip.partition)
           .setErrorCode(maybeDownConvertStorageError(data.error).code)
           .setHighWatermark(data.highWatermark)
           .setLastStableOffset(lastStableOffset)
@@ -654,6 +715,8 @@ class KafkaApis(val requestChannel: RequestChannel,
         if (versionId >= 16) {
           data.error match {
             case Errors.NOT_LEADER_OR_FOLLOWER | Errors.FENCED_LEADER_EPOCH =>
+              // getCurrentLeader needs the physical partition; topicIdPartition always has the physical name here
+              // (physicalToLinkTip tracks the reverse mapping for v12- only)
               val leaderNode = getCurrentLeader(topicIdPartition.topicPartition(), request.context.listenerName)
               leaderNode.node.foreach { node =>
                 nodeEndpoints.put(node.id(), node)
@@ -666,7 +729,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
 
         data.divergingEpoch.ifPresent(epoch => partitionData.setDivergingEpoch(epoch))
-        partitions.put(topicIdPartition, partitionData)
+        partitions.put(responseTip, partitionData)
       }
       erroneous.foreach { case (tp, data) => partitions.put(tp, data) }
 
@@ -784,6 +847,13 @@ class KafkaApis(val requestChannel: RequestChannel,
     val clientId = request.header.clientId
     val offsetRequest = request.body[ListOffsetsRequest]
     val version = request.header.apiVersion
+    val principal = request.context.principal.getName
+
+    // Request path: translate link names → physical names in-place for VC users.
+    offsetRequest.topics.forEach { topic =>
+      val resolved = metadataCache.resolveTopicName(principal, topic.name)
+      topic.setName(resolved)
+    }
 
     def buildErrorResponse(e: Errors, partition: ListOffsetsPartition): ListOffsetsPartitionResponse = {
       new ListOffsetsPartitionResponse()
@@ -798,12 +868,16 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val unauthorizedResponseStatus = unauthorizedRequestInfo.map(topic =>
       new ListOffsetsTopicResponse()
-        .setName(topic.name)
+        .setName(metadataCache.linkNameForTopic(principal, topic.name))
         .setPartitions(topic.partitions.asScala.map(partition =>
           buildErrorResponse(Errors.TOPIC_AUTHORIZATION_FAILED, partition)).asJava)
     ).asJava
 
     def sendResponseCallback(response: util.Collection[ListOffsetsTopicResponse]): Void = {
+      // Response path: translate physical names back to link names for VC users.
+      response.forEach { topic =>
+        topic.setName(metadataCache.linkNameForTopic(principal, topic.name))
+      }
       val mergedResponses = new util.ArrayList(response)
       mergedResponses.addAll(unauthorizedResponseStatus)
       requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
@@ -881,6 +955,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleTopicMetadataRequest(request: RequestChannel.Request): Unit = {
     val metadataRequest = request.body[MetadataRequest]
     val requestVersion = request.header.apiVersion
+    val principal = request.context.principal.getName
 
     // Topic IDs are not supported for versions 10 and 11. Topic names can not be null in these versions.
     if (!metadataRequest.isAllTopics) {
@@ -904,21 +979,36 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unknownTopicIdsTopicMetadata = unknownTopicIds.map(topicId =>
         metadataResponseTopic(Errors.UNKNOWN_TOPIC_ID, null, topicId, isInternal = false, util.Collections.emptyList())).toSeq
 
-    val topics = if (metadataRequest.isAllTopics)
-      metadataCache.getAllTopics.asScala
+    // For VC users requesting all topics: show only the physical names of their VC's links (not all
+    // physical topics). Non-VC users and topic-ID-based requests are unaffected.
+    val vcLinkNames = metadataCache.getVcTopicLinkNames(principal).asScala
+    val isVcUser = vcLinkNames.nonEmpty
+
+    // Build a Set[String] of topic names to look up.  For VC users we work in physical names
+    // throughout (authorization, cache lookup) and translate back to link names in the response.
+    val topics: Set[String] = if (metadataRequest.isAllTopics && isVcUser)
+      // Resolve each link name to its physical name for the metadata lookup
+      vcLinkNames.map(linkName => metadataCache.resolveTopicName(principal, linkName)).toSet
+    else if (metadataRequest.isAllTopics)
+      metadataCache.getAllTopics.asScala.toSet
     else if (useTopicId)
-      knownTopicNames
-    else
-      metadataRequest.topics.asScala.toSet
+      knownTopicNames.toSet
+    else {
+      // Translate link names → physical names for explicit topic lists
+      metadataRequest.topics.asScala.toSet.map(name => metadataCache.resolveTopicName(principal, name))
+    }
 
     val authorizedForDescribeTopics = authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC,
-      topics, logIfDenied = !metadataRequest.isAllTopics)(identity)
+        topics, logIfDenied = !metadataRequest.isAllTopics)(identity)
     var (authorizedTopics, unauthorizedForDescribeTopics) = topics.partition(authorizedForDescribeTopics.contains)
     var unauthorizedForCreateTopics = Set[String]()
 
     if (authorizedTopics.nonEmpty) {
       val nonExistingTopics = authorizedTopics.filterNot(metadataCache.contains)
-      if (metadataRequest.allowAutoTopicCreation && config.autoCreateTopicsEnable && nonExistingTopics.nonEmpty) {
+      // VC users must not trigger auto-topic-creation: links must be explicitly registered.
+      // Unknown link names (resolveTopicName returns "") are simply not found in the cache,
+      // and should be returned as UNKNOWN_TOPIC_OR_PARTITION, not auto-created.
+      if (metadataRequest.allowAutoTopicCreation && config.autoCreateTopicsEnable && nonExistingTopics.nonEmpty && !isVcUser) {
         if (!authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false)) {
           val authorizedForCreateTopics = authHelper.filterByAuthorized(request.context, CREATE, TOPIC,
             nonExistingTopics)(identity)
@@ -954,9 +1044,18 @@ class KafkaApis(val requestChannel: RequestChannel,
     // From version 6 onwards, we return LISTENER_NOT_FOUND to enable diagnosis of configuration errors.
     val errorUnavailableListeners = requestVersion >= 6
 
-    val allowAutoCreation = config.autoCreateTopicsEnable && metadataRequest.allowAutoTopicCreation && !metadataRequest.isAllTopics
+    // VC users must never trigger auto-topic-creation — links are registered explicitly only.
+    val allowAutoCreation = config.autoCreateTopicsEnable && metadataRequest.allowAutoTopicCreation && !metadataRequest.isAllTopics && !isVcUser
     val topicMetadata = getTopicMetadata(request, metadataRequest.isAllTopics, allowAutoCreation, authorizedTopics,
       request.context.listenerName, errorUnavailableEndpoints, errorUnavailableListeners)
+
+    // Response path: translate physical topic names back to link names for VC users.
+    // Topic-ID-based results (useTopicId) are not renamed — the client resolves names from IDs.
+    if (!useTopicId) {
+      topicMetadata.foreach { t =>
+        t.setName(metadataCache.linkNameForTopic(principal, t.name))
+      }
+    }
 
     var clusterAuthorizedOperations = Int.MinValue // Default value in the schema
     if (requestVersion >= 8) {
@@ -1003,7 +1102,25 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   def handleDescribeTopicPartitionsRequest(request: RequestChannel.Request): Unit = {
+    val principal = request.context.principal.getName
+
+    // Request path: translate link names → physical names in-place so the handler's metadata
+    // lookups find the physical topics.  We restore nothing — the response rename below
+    // is the single source of truth for what the client sees.
+    val describeRequest = request.body[DescribeTopicPartitionsRequest]
+    describeRequest.data.topics.forEach { topic =>
+      val resolved = metadataCache.resolveTopicName(principal, topic.name)
+      debug(s"[VC] DescribeTopicPartitions: principal=$principal topic=${topic.name} resolved=$resolved")
+      topic.setName(resolved)
+    }
+
     val response = describeTopicPartitionsRequestHandler.handleDescribeTopicPartitionsRequest(request)
+
+    // Response path: translate physical names back to link names for VC users.
+    response.topics.forEach { topic =>
+      topic.setName(metadataCache.linkNameForTopic(principal, topic.name))
+    }
+
     trace("Sending topic partitions metadata %s for correlation id %d to client %s".format(response.topics().asScala.mkString(","),
       request.header.correlationId, request.header.clientId))
 
@@ -1030,24 +1147,32 @@ class KafkaApis(val requestChannel: RequestChannel,
           Errors.GROUP_AUTHORIZATION_FAILED,
           request.header.apiVersion()
         ))
-      } else if (isAllPartitions) {
-        futures += fetchAllOffsetsForGroup(
-          request.context,
-          groupOffsetFetch,
-          requireStable
-        )
       } else {
-        futures += fetchOffsetsForGroup(
-          request.context,
-          groupOffsetFetch,
-          requireStable
-        )
+        // Request path: translate local group ID → physical (VC-prefixed) group ID for VC users.
+        val principal = request.context.principal.getName
+        groupOffsetFetch.setGroupId(metadataCache.resolveGroupId(principal, groupOffsetFetch.groupId))
+        if (isAllPartitions) {
+          futures += fetchAllOffsetsForGroup(
+            request.context,
+            groupOffsetFetch,
+            requireStable
+          )
+        } else {
+          futures += fetchOffsetsForGroup(
+            request.context,
+            groupOffsetFetch,
+            requireStable
+          )
+        }
       }
     }
 
     CompletableFuture.allOf(futures.toArray: _*).handle[Unit] { (_, _) =>
       val groupResponses = new ArrayBuffer[OffsetFetchResponseData.OffsetFetchResponseGroup](futures.size)
       futures.foreach(future => groupResponses += future.get())
+      // Response path: strip VC prefix from group IDs before returning to client.
+      val principal = request.context.principal.getName
+      groupResponses.foreach { g => g.setGroupId(metadataCache.localGroupId(principal, g.groupId)) }
       requestHelper.sendMaybeThrottle(request, new OffsetFetchResponse.Builder(groupResponses.asJava).build(request.context.apiVersion))
     }
   }
@@ -1058,6 +1183,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     requireStable: Boolean
   ): CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup] = {
     val useTopicIds = OffsetFetchRequest.useTopicIds(requestContext.apiVersion)
+    val principal = requestContext.principal.getName
 
     groupCoordinator.fetchOffsets(
       requestContext,
@@ -1075,11 +1201,11 @@ class KafkaApis(val requestChannel: RequestChannel,
       } else {
         // Clients are not allowed to see offsets for topics that are not authorized for Describe.
         val authorizedNames = authHelper.filterByAuthorized(
-          requestContext,
-          DESCRIBE,
-          TOPIC,
-          groupFetchResponse.topics.asScala
-        )(_.name)
+            requestContext,
+            DESCRIBE,
+            TOPIC,
+            groupFetchResponse.topics.asScala
+          )(_.name)
 
         val topics = new mutable.ArrayBuffer[OffsetFetchResponseData.OffsetFetchResponseTopics]
         groupFetchResponse.topics.forEach { topic =>
@@ -1096,6 +1222,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 topics += topic
               }
             } else {
+              // Response path: translate physical names back to link names for VC users.
+              topic.setName(metadataCache.linkNameForTopic(principal, topic.name))
               topics += topic
             }
           }
@@ -1111,12 +1239,20 @@ class KafkaApis(val requestChannel: RequestChannel,
     requireStable: Boolean
   ): CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup] = {
     val useTopicIds = OffsetFetchRequest.useTopicIds(requestContext.apiVersion)
+    val principal = requestContext.principal.getName
 
     if (useTopicIds) {
       groupFetchRequest.topics.forEach { topic =>
         if (topic.topicId != Uuid.ZERO_UUID) {
           metadataCache.getTopicName(topic.topicId).ifPresent(name => topic.setName(name))
         }
+      }
+    }
+
+    // Request path: translate link names → physical names in-place for VC users (name-based versions only).
+    if (!useTopicIds) {
+      groupFetchRequest.topics.forEach { topic =>
+        topic.setName(metadataCache.resolveTopicName(principal, topic.name))
       }
     }
 
@@ -1137,7 +1273,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     ): OffsetFetchResponseData.OffsetFetchResponseTopics = {
       val topicResponse = new OffsetFetchResponseData.OffsetFetchResponseTopics()
         .setTopicId(topic.topicId)
-        .setName(topic.name)
+        .setName(metadataCache.linkNameForTopic(principal, topic.name))
       topic.partitionIndexes.forEach { partitionIndex =>
         topicResponse.partitions.add(new OffsetFetchResponseData.OffsetFetchResponsePartitions()
           .setPartitionIndex(partitionIndex)
@@ -1178,6 +1314,10 @@ class KafkaApis(val requestChannel: RequestChannel,
         val topics = new util.ArrayList[OffsetFetchResponseData.OffsetFetchResponseTopics](
           groupFetchRequest.topics.size + errorTopics.size
         )
+        // Response path: translate physical names back to link names for VC users (name-based versions only).
+        if (!useTopicIds) {
+          groupFetchResponse.topics.forEach { t => t.setName(metadataCache.linkNameForTopic(principal, t.name)) }
+        }
         topics.addAll(groupFetchResponse.topics)
         topics.addAll(errorTopics.asJava)
         groupFetchResponse.setTopics(topics)
@@ -1196,11 +1336,17 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   private def handleFindCoordinatorRequestV4AndAbove(request: RequestChannel.Request): Unit = {
     val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+    val principal = request.context.principal.getName
+    val keyType = findCoordinatorRequest.data.keyType
 
     val coordinators = findCoordinatorRequest.data.coordinatorKeys.asScala.map { key =>
-      val (error, node) = getCoordinator(request, findCoordinatorRequest.data.keyType, key)
+      // Request path: translate local group ID → physical for VC users when keyType is GROUP.
+      val resolvedKey = if (keyType == CoordinatorType.GROUP.id)
+        metadataCache.resolveGroupId(principal, key)
+      else key
+      val (error, node) = getCoordinator(request, keyType, resolvedKey)
       new FindCoordinatorResponseData.Coordinator()
-        .setKey(key)
+        .setKey(key)  // always echo back the original (local) key to the client
         .setErrorCode(error.code)
         .setHost(node.host)
         .setNodeId(node.id)
@@ -1220,8 +1366,15 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   private def handleFindCoordinatorRequestLessThanV4(request: RequestChannel.Request): Unit = {
     val findCoordinatorRequest = request.body[FindCoordinatorRequest]
+    val principal = request.context.principal.getName
+    val keyType = findCoordinatorRequest.data.keyType
+    val originalKey = findCoordinatorRequest.data.key
+    // Request path: translate local group ID → physical for VC users when keyType is GROUP.
+    val resolvedKey = if (keyType == CoordinatorType.GROUP.id)
+      metadataCache.resolveGroupId(principal, originalKey)
+    else originalKey
 
-    val (error, node) = getCoordinator(request, findCoordinatorRequest.data.keyType, findCoordinatorRequest.data.key)
+    val (error, node) = getCoordinator(request, keyType, resolvedKey)
     def createResponse(requestThrottleMs: Int): AbstractResponse = {
       val responseBody = new FindCoordinatorResponse(
           new FindCoordinatorResponseData()
@@ -1305,6 +1458,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     val includeAuthorizedOperations = describeRequest.data.includeAuthorizedOperations
     val response = new DescribeGroupsResponseData()
     val authorizedGroups = new ArrayBuffer[String]()
+    val principal = request.context.principal.getName
 
     describeRequest.data.groups.forEach { groupId =>
       if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupId)) {
@@ -1313,7 +1467,8 @@ class KafkaApis(val requestChannel: RequestChannel,
           Errors.GROUP_AUTHORIZATION_FAILED
         ))
       } else {
-        authorizedGroups += groupId
+        // Request path: translate local group ID → physical (VC-prefixed) for VC users.
+        authorizedGroups += metadataCache.resolveGroupId(principal, groupId)
       }
     }
 
@@ -1335,6 +1490,11 @@ class KafkaApis(val requestChannel: RequestChannel,
           }
         }
 
+        // Response path: strip VC prefix from group IDs before returning to client.
+        results.forEach { groupResult =>
+          groupResult.setGroupId(metadataCache.localGroupId(principal, groupResult.groupId))
+        }
+
         if (response.groups.isEmpty) {
           // If the response is empty, we can directly reuse the results.
           response.setGroups(results)
@@ -1351,6 +1511,8 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleListGroupsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val listGroupsRequest = request.body[ListGroupsRequest]
     val hasClusterDescribe = authHelper.authorize(request.context, DESCRIBE, CLUSTER, CLUSTER_NAME, logIfDenied = false)
+    val principal = request.context.principal.getName
+    val isVcUser = metadataCache.getVcTopicLinkNames(principal).asScala.nonEmpty
 
     groupCoordinator.listGroups(
       request.context,
@@ -1361,13 +1523,29 @@ class KafkaApis(val requestChannel: RequestChannel,
       } else {
         val listGroupsResponse = if (hasClusterDescribe) {
           // With describe cluster access all groups are returned. We keep this alternative for backward compatibility.
-          new ListGroupsResponse(response)
+          // For VC users, filter to only their VC's groups and strip the prefix.
+          if (isVcUser) {
+            val vcGroups = response.groups.asScala
+              .filter(g => metadataCache.isGroupInVc(principal, g.groupId))
+              .map { g => g.setGroupId(metadataCache.localGroupId(principal, g.groupId)); g }
+            new ListGroupsResponse(response.setGroups(vcGroups.asJava))
+          } else {
+            new ListGroupsResponse(response)
+          }
         } else {
           // Otherwise, only groups with described group are returned.
           val authorizedGroups = response.groups.asScala.filter { group =>
             authHelper.authorize(request.context, DESCRIBE, GROUP, group.groupId, logIfDenied = false)
           }
-          new ListGroupsResponse(response.setGroups(authorizedGroups.asJava))
+          // For VC users, additionally filter to their VC and strip the prefix.
+          val filteredGroups = if (isVcUser) {
+            authorizedGroups
+              .filter(g => metadataCache.isGroupInVc(principal, g.groupId))
+              .map { g => g.setGroupId(metadataCache.localGroupId(principal, g.groupId)); g }
+          } else {
+            authorizedGroups
+          }
+          new ListGroupsResponse(response.setGroups(filteredGroups.asJava))
         }
         requestHelper.sendMaybeThrottle(request, listGroupsResponse)
       }
@@ -1384,6 +1562,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      // Request path: translate local group ID → physical (VC-prefixed) for VC users.
+      val principal = request.context.principal.getName
+      joinGroupRequest.data.setGroupId(metadataCache.resolveGroupId(principal, joinGroupRequest.data.groupId))
       groupCoordinator.joinGroup(
         request.context,
         joinGroupRequest.data,
@@ -1412,6 +1593,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendMaybeThrottle(request, syncGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      // Request path: translate local group ID → physical (VC-prefixed) for VC users.
+      val principal = request.context.principal.getName
+      syncGroupRequest.data.setGroupId(metadataCache.resolveGroupId(principal, syncGroupRequest.data.groupId))
       groupCoordinator.syncGroup(
         request.context,
         syncGroupRequest.data,
@@ -1431,10 +1615,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestLocal: RequestLocal
   ): CompletableFuture[Unit] = {
     val deleteGroupsRequest = request.body[DeleteGroupsRequest]
+    val principal = request.context.principal.getName
+    // Keep a mapping from physical → local group ID so we can strip the prefix in the response.
     val groups = deleteGroupsRequest.data.groupsNames.asScala.distinct
+    // Request path: translate local group IDs → physical (VC-prefixed) for VC users.
+    val physicalGroups = groups.map(g => metadataCache.resolveGroupId(principal, g))
 
     val (authorizedGroups, unauthorizedGroups) =
-      authHelper.partitionSeqByAuthorized(request.context, DELETE, GROUP, groups)(identity)
+      authHelper.partitionSeqByAuthorized(request.context, DELETE, GROUP, physicalGroups)(identity)
 
     groupCoordinator.deleteGroups(
       request.context,
@@ -1447,16 +1635,18 @@ class KafkaApis(val requestChannel: RequestChannel,
         val error = Errors.forException(exception)
         authorizedGroups.foreach { groupId =>
           response.results.add(new DeleteGroupsResponseData.DeletableGroupResult()
-            .setGroupId(groupId)
+            .setGroupId(metadataCache.localGroupId(principal, groupId))
             .setErrorCode(error.code))
         }
       } else {
+        // Response path: strip VC prefix from group IDs before returning to client.
+        results.forEach { r => r.setGroupId(metadataCache.localGroupId(principal, r.groupId)) }
         response.setResults(results)
       }
 
       unauthorizedGroups.foreach { groupId =>
         response.results.add(new DeleteGroupsResponseData.DeletableGroupResult()
-          .setGroupId(groupId)
+          .setGroupId(metadataCache.localGroupId(principal, groupId))
           .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code))
       }
 
@@ -1471,6 +1661,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      // Request path: translate local group ID → physical (VC-prefixed) for VC users.
+      val principal = request.context.principal.getName
+      heartbeatRequest.data.setGroupId(metadataCache.resolveGroupId(principal, heartbeatRequest.data.groupId))
       groupCoordinator.heartbeat(
         request.context,
         heartbeatRequest.data
@@ -1491,9 +1684,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
+      // Request path: translate local group ID → physical (VC-prefixed) for VC users.
+      val principal = request.context.principal.getName
+      val normalizedData = leaveGroupRequest.normalizedData()
+      normalizedData.setGroupId(metadataCache.resolveGroupId(principal, normalizedData.groupId))
       groupCoordinator.leaveGroup(
         request.context,
-        leaveGroupRequest.normalizedData()
+        normalizedData
       ).handle[Unit] { (response, exception) =>
         if (exception != null) {
           requestHelper.sendMaybeThrottle(request, leaveGroupRequest.getErrorResponse(exception))
@@ -2208,7 +2405,25 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   def handleDescribeConfigsRequest(request: RequestChannel.Request): Unit = {
+    val principal = request.context.principal.getName
+
+    // Request path: translate TOPIC link names → physical names in-place for VC users.
+    val describeConfigsRequest = request.body[DescribeConfigsRequest]
+    describeConfigsRequest.data.resources.forEach { resource =>
+      if (ConfigResource.Type.forId(resource.resourceType) == ConfigResource.Type.TOPIC) {
+        resource.setResourceName(metadataCache.resolveTopicName(principal, resource.resourceName))
+      }
+    }
+
     val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)
+
+    // Response path: translate physical names back to link names for VC users.
+    responseData.results.forEach { result =>
+      if (ConfigResource.Type.forId(result.resourceType) == ConfigResource.Type.TOPIC) {
+        result.setResourceName(metadataCache.linkNameForTopic(principal, result.resourceName))
+      }
+    }
+
     requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
       new DescribeConfigsResponse(responseData.setThrottleTimeMs(requestThrottleMs)))
   }

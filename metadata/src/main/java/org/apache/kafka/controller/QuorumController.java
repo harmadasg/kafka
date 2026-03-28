@@ -36,6 +36,7 @@ import org.apache.kafka.common.message.AlterPartitionRequestData;
 import org.apache.kafka.common.message.AlterPartitionResponseData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsRequestData;
 import org.apache.kafka.common.message.AlterUserScramCredentialsResponseData;
+import org.apache.kafka.common.message.AlterVirtualClusterRequestData.AlterableVirtualCluster;
 import org.apache.kafka.common.message.AssignReplicasToDirsRequestData;
 import org.apache.kafka.common.message.AssignReplicasToDirsResponseData;
 import org.apache.kafka.common.message.BrokerHeartbeatRequestData;
@@ -78,6 +79,9 @@ import org.apache.kafka.common.metadata.RegisterControllerRecord;
 import org.apache.kafka.common.metadata.RemoveAccessControlEntryRecord;
 import org.apache.kafka.common.metadata.RemoveDelegationTokenRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
+import org.apache.kafka.common.metadata.RemoveVirtualClusterRecord;
+import org.apache.kafka.common.metadata.VirtualClusterChangeRecord;
+import org.apache.kafka.common.metadata.VirtualClusterRecord;
 import org.apache.kafka.common.metadata.RemoveUserScramCredentialRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
@@ -1295,6 +1299,15 @@ public final class QuorumController implements Controller {
             case CLEAR_ELR_RECORD:
                 replicationControl.replay((ClearElrRecord) message);
                 break;
+            case VIRTUAL_CLUSTER_RECORD:
+                virtualClusterControlManager.replay((VirtualClusterRecord) message);
+                break;
+            case REMOVE_VIRTUAL_CLUSTER_RECORD:
+                virtualClusterControlManager.replay((RemoveVirtualClusterRecord) message);
+                break;
+            case VIRTUAL_CLUSTER_CHANGE_RECORD:
+                virtualClusterControlManager.replay((VirtualClusterChangeRecord) message);
+                break;
             default:
                 throw new RuntimeException("Unhandled record type " + type);
         }
@@ -1428,6 +1441,12 @@ public final class QuorumController implements Controller {
      * This must be accessed only by the event queue thread.
      */
     private final AclControlManager aclControlManager;
+
+    /**
+     * Manages virtual clusters in the cluster.
+     * This must be accessed only by the event queue thread.
+     */
+    private final VirtualClusterControlManager virtualClusterControlManager;
 
     /**
      * The interface that we use to mutate the Raft log.
@@ -1584,6 +1603,11 @@ public final class QuorumController implements Controller {
         this.aclControlManager = new AclControlManager.Builder().
             setLogContext(logContext).
             setSnapshotRegistry(snapshotRegistry).
+            build();
+        this.virtualClusterControlManager = new VirtualClusterControlManager.Builder().
+            setLogContext(logContext).
+            setSnapshotRegistry(snapshotRegistry).
+            setReplicationControl(replicationControl).
             build();
         this.raftClient = raftClient;
         this.bootstrapMetadata = bootstrapMetadata;
@@ -2130,6 +2154,50 @@ public final class QuorumController implements Controller {
     ) {
         return appendWriteEvent("deleteAcls", context.deadlineNs(),
             () -> aclControlManager.deleteAcls(filters));
+    }
+
+    @Override
+    public CompletableFuture<Void> createVirtualCluster(
+        ControllerRequestContext context,
+        String name
+    ) {
+        return appendWriteEvent("createVirtualCluster", context.deadlineNs(),
+            () -> virtualClusterControlManager.createVirtualCluster(name, featureControl.metadataVersionOrThrow()));
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteVirtualCluster(
+        ControllerRequestContext context,
+        String name
+    ) {
+        return appendWriteEvent("deleteVirtualCluster", context.deadlineNs(),
+            () -> virtualClusterControlManager.deleteVirtualCluster(name, featureControl.metadataVersionOrThrow()));
+    }
+
+    @Override
+    public CompletableFuture<Void> alterVirtualCluster(
+        ControllerRequestContext context,
+        AlterableVirtualCluster data
+    ) {
+        return appendWriteEvent("alterVirtualCluster", context.deadlineNs(),
+            () -> virtualClusterControlManager.alterVirtualCluster(data, featureControl.metadataVersionOrThrow()));
+    }
+
+    @Override
+    public CompletableFuture<List<String>> listVirtualClusters(
+        ControllerRequestContext context
+    ) {
+        return appendReadEvent("listVirtualClusters", context.deadlineNs(),
+            () -> virtualClusterControlManager.listVirtualClusters(featureControl.metadataVersionOrThrow()));
+    }
+
+    @Override
+    public CompletableFuture<VirtualClusterRecord> describeVirtualCluster(
+        ControllerRequestContext context,
+        String name
+    ) {
+        return appendReadEvent("describeVirtualCluster", context.deadlineNs(),
+            () -> virtualClusterControlManager.describeVirtualCluster(name, featureControl.metadataVersionOrThrow()));
     }
 
     @Override

@@ -130,7 +130,9 @@ public enum MetadataVersion {
     // they have set the configuration unstable.feature.versions.enable=true.
     // Please move this comment when updating the LATEST_PRODUCTION constant.
     //
-    IBP_4_4_IV0(31, "4.4", "IV0", false);
+
+    // New version for the Kafka 4.4.0 release and support for virtual clusters.
+    IBP_4_4_IV0(31, "4.4", "IV0", true);
 
 
     // NOTES when adding a new version:
@@ -217,6 +219,10 @@ public enum MetadataVersion {
 
     public boolean isCordonedLogDirsSupported() {
         return this.isAtLeast(MetadataVersion.IBP_4_3_IV0);
+    }
+
+    public boolean areVirtualClustersSupported() {
+        return this.isAtLeast(IBP_4_4_IV0);
     }
 
     public short registerBrokerRecordVersion() {

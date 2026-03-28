@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.apache.kafka.common.acl.AclOperation.DESCRIBE;
+import static org.apache.kafka.common.resource.ResourceType.CLUSTER;
 import static org.apache.kafka.common.resource.ResourceType.TOPIC;
 
 public class DescribeTopicPartitionsRequestHandler {

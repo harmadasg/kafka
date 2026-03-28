@@ -824,6 +824,105 @@ public interface Admin extends AutoCloseable {
     ExpireDelegationTokenResult expireDelegationToken(byte[] hmac, ExpireDelegationTokenOptions options);
 
     /**
+     * Create one or more virtual clusters.
+     * <p>
+     * This is a convenience method for
+     * {@link #createVirtualClusters(Collection, CreateVirtualClusterOptions)} with default options.
+     *
+     * @param newVirtualClusters The virtual clusters to create.
+     * @return The CreateVirtualClustersResult.
+     */
+    default CreateVirtualClustersResult createVirtualClusters(Collection<NewVirtualCluster> newVirtualClusters) {
+        return createVirtualClusters(newVirtualClusters, new CreateVirtualClusterOptions());
+    }
+
+    /**
+     * Create one or more virtual clusters.
+     *
+     * @param newVirtualClusters The virtual clusters to create.
+     * @param options            The options to use when creating the virtual clusters.
+     * @return The CreateVirtualClustersResult.
+     */
+    CreateVirtualClustersResult createVirtualClusters(Collection<NewVirtualCluster> newVirtualClusters,
+                                                      CreateVirtualClusterOptions options);
+
+    /**
+     * Delete one or more virtual clusters.
+     * <p>
+     * This is a convenience method for
+     * {@link #deleteVirtualClusters(Collection, DeleteVirtualClusterOptions)} with default options.
+     *
+     * @param virtualClusterNames The names of the virtual clusters to delete.
+     * @return The DeleteVirtualClustersResult.
+     */
+    default DeleteVirtualClustersResult deleteVirtualClusters(Collection<String> virtualClusterNames) {
+        return deleteVirtualClusters(virtualClusterNames, new DeleteVirtualClusterOptions());
+    }
+
+    /**
+     * Delete one or more virtual clusters.
+     *
+     * @param virtualClusterNames The names of the virtual clusters to delete.
+     * @param options             The options to use when deleting the virtual clusters.
+     * @return The DeleteVirtualClustersResult.
+     */
+    DeleteVirtualClustersResult deleteVirtualClusters(Collection<String> virtualClusterNames,
+                                                      DeleteVirtualClusterOptions options);
+
+    /**
+     * Alter one or more virtual clusters by adding or removing resources.
+     * <p>
+     * This is a convenience method for
+     * {@link #alterVirtualClusters(Collection, AlterVirtualClusterOptions)} with default options.
+     *
+     * @param alterations The alterations to apply.
+     * @return The AlterVirtualClustersResult.
+     */
+    default AlterVirtualClustersResult alterVirtualClusters(Collection<VirtualClusterAlteration> alterations) {
+        return alterVirtualClusters(alterations, new AlterVirtualClusterOptions());
+    }
+
+    /**
+     * Alter one or more virtual clusters by adding or removing resources.
+     *
+     * @param alterations The alterations to apply.
+     * @param options     The options to use when altering the virtual clusters.
+     * @return The AlterVirtualClustersResult.
+     */
+    AlterVirtualClustersResult alterVirtualClusters(Collection<VirtualClusterAlteration> alterations,
+                                                    AlterVirtualClusterOptions options);
+
+    /**
+     * List all virtual clusters.
+     *
+     * @return The ListVirtualClustersResult.
+     */
+    ListVirtualClustersResult listVirtualClusters();
+
+    /**
+     * Describe one or more virtual clusters.
+     * <p>
+     * This is a convenience method for
+     * {@link #describeVirtualClusters(Collection, DescribeVirtualClusterOptions)} with default options.
+     *
+     * @param virtualClusterNames The names of the virtual clusters to describe.
+     * @return The DescribeVirtualClustersResult.
+     */
+    default DescribeVirtualClustersResult describeVirtualClusters(Collection<String> virtualClusterNames) {
+        return describeVirtualClusters(virtualClusterNames, new DescribeVirtualClusterOptions());
+    }
+
+    /**
+     * Describe one or more virtual clusters.
+     *
+     * @param virtualClusterNames The names of the virtual clusters to describe.
+     * @param options             The options to use when describing the virtual clusters.
+     * @return The DescribeVirtualClustersResult.
+     */
+    DescribeVirtualClustersResult describeVirtualClusters(Collection<String> virtualClusterNames,
+                                                          DescribeVirtualClusterOptions options);
+
+    /**
      * Describe the Delegation Tokens.
      * <p>
      * This is a convenience method for {@link #describeDelegationToken(DescribeDelegationTokenOptions)} with default options.

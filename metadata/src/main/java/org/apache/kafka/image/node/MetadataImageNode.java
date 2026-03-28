@@ -33,17 +33,18 @@ public record MetadataImageNode(MetadataImage image) implements MetadataNode {
      */
     public static final String NAME = "image";
 
-    private static final Map<String, Function<MetadataImage, MetadataNode>> CHILDREN = Map.of(
-        ProvenanceNode.NAME, image -> new ProvenanceNode(image.provenance()),
-        FeaturesImageNode.NAME, image -> new FeaturesImageNode(image.features()),
-        ClusterImageNode.NAME, image -> new ClusterImageNode(image.cluster()),
-        TopicsImageNode.NAME, image -> new TopicsImageNode(image.topics()),
-        ConfigurationsImageNode.NAME, image -> new ConfigurationsImageNode(image.configs()),
-        ClientQuotasImageNode.NAME, image -> new ClientQuotasImageNode(image.clientQuotas()),
-        ProducerIdsImageNode.NAME, image -> new ProducerIdsImageNode(image.producerIds()),
-        AclsImageNode.NAME, image -> new AclsImageNode(image.acls()),
-        ScramImageNode.NAME, image -> new ScramImageNode(image.scram()),
-        DelegationTokenImageNode.NAME, image -> new DelegationTokenImageNode(image.delegationTokens())
+    private static final Map<String, Function<MetadataImage, MetadataNode>> CHILDREN = Map.ofEntries(
+        Map.entry(ProvenanceNode.NAME, image -> new ProvenanceNode(image.provenance())),
+        Map.entry(FeaturesImageNode.NAME, image -> new FeaturesImageNode(image.features())),
+        Map.entry(ClusterImageNode.NAME, image -> new ClusterImageNode(image.cluster())),
+        Map.entry(TopicsImageNode.NAME, image -> new TopicsImageNode(image.topics())),
+        Map.entry(ConfigurationsImageNode.NAME, image -> new ConfigurationsImageNode(image.configs())),
+        Map.entry(ClientQuotasImageNode.NAME, image -> new ClientQuotasImageNode(image.clientQuotas())),
+        Map.entry(ProducerIdsImageNode.NAME, image -> new ProducerIdsImageNode(image.producerIds())),
+        Map.entry(AclsImageNode.NAME, image -> new AclsImageNode(image.acls())),
+        Map.entry(ScramImageNode.NAME, image -> new ScramImageNode(image.scram())),
+        Map.entry(DelegationTokenImageNode.NAME, image -> new DelegationTokenImageNode(image.delegationTokens())),
+        Map.entry(VirtualClustersImageNode.NAME, image -> new VirtualClustersImageNode(image.virtualClusters()))
     );
 
     @Override

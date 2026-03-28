@@ -149,6 +149,31 @@ public class ForwardingAdmin implements Admin {
     }
 
     @Override
+    public CreateVirtualClustersResult createVirtualClusters(Collection<NewVirtualCluster> newVirtualClusters, CreateVirtualClusterOptions options) {
+        return delegate.createVirtualClusters(newVirtualClusters, options);
+    }
+
+    @Override
+    public DeleteVirtualClustersResult deleteVirtualClusters(Collection<String> virtualClusterNames, DeleteVirtualClusterOptions options) {
+        return delegate.deleteVirtualClusters(virtualClusterNames, options);
+    }
+
+    @Override
+    public AlterVirtualClustersResult alterVirtualClusters(Collection<VirtualClusterAlteration> alterations, AlterVirtualClusterOptions options) {
+        return delegate.alterVirtualClusters(alterations, options);
+    }
+
+    @Override
+    public ListVirtualClustersResult listVirtualClusters() {
+        return delegate.listVirtualClusters();
+    }
+
+    @Override
+    public DescribeVirtualClustersResult describeVirtualClusters(Collection<String> virtualClusterNames, DescribeVirtualClusterOptions options) {
+        return delegate.describeVirtualClusters(virtualClusterNames, options);
+    }
+
+    @Override
     public DescribeDelegationTokenResult describeDelegationToken(DescribeDelegationTokenOptions options) {
         return delegate.describeDelegationToken(options);
     }

@@ -19,7 +19,7 @@ package kafka.server
 
 import java.{lang, util}
 import java.nio.ByteBuffer
-import java.util.{Collections, OptionalLong}
+import java.util.{Collections, OptionalLong, UUID}
 import java.util.Map.Entry
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
@@ -34,6 +34,7 @@ import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, TopicDeletionDisabledException, UnsupportedVersionException}
 import org.apache.kafka.common.internals.{FatalExitError, Plugin, Topic}
 import org.apache.kafka.common.message.AlterConfigsResponseData.{AlterConfigsResourceResponse => OldAlterConfigsResourceResponse}
+import org.apache.kafka.common.message.AlterVirtualClusterRequestData.{AlterVirtualClusterResource, AlterableVirtualCluster}
 import org.apache.kafka.common.message.CreatePartitionsRequestData.CreatePartitionsTopic
 import org.apache.kafka.common.message.CreatePartitionsResponseData.CreatePartitionsTopicResult
 import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult
@@ -50,6 +51,7 @@ import org.apache.kafka.common.Uuid
 import org.apache.kafka.controller.ControllerRequestContext.requestTimeoutMsToDeadlineNs
 import org.apache.kafka.controller.{Controller, ControllerRequestContext}
 import org.apache.kafka.image.publisher.ControllerRegistrationsPublisher
+import org.apache.kafka.image.VirtualClusterImage
 import org.apache.kafka.metadata.{BrokerHeartbeatReply, BrokerRegistrationReply, KRaftMetadataCache}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.security.auth.SecurityProtocol
@@ -61,6 +63,7 @@ import org.apache.kafka.server.common.{ApiMessageAndVersion, RequestLocal}
 import org.apache.kafka.server.quota.ControllerMutationQuota
 
 import scala.jdk.CollectionConverters._
+import scala.jdk.OptionConverters._
 
 
 /**
@@ -133,6 +136,11 @@ class ControllerApis(
         case ApiKeys.ADD_RAFT_VOTER => handleAddRaftVoter(request)
         case ApiKeys.REMOVE_RAFT_VOTER => handleRemoveRaftVoter(request)
         case ApiKeys.UPDATE_RAFT_VOTER => handleUpdateRaftVoter(request)
+        case ApiKeys.CREATE_VIRTUAL_CLUSTER => handleCreateVirtualCluster(request)
+        case ApiKeys.DELETE_VIRTUAL_CLUSTER => handleDeleteVirtualCluster(request)
+        case ApiKeys.ALTER_VIRTUAL_CLUSTER => handleAlterVirtualCluster(request)
+        case ApiKeys.LIST_VIRTUAL_CLUSTER => handleListVirtualClusters(request)
+        case ApiKeys.DESCRIBE_VIRTUAL_CLUSTER => handleDescribeVirtualCluster(request)
         case _ => throw new ApiException(s"Unsupported ApiKey ${request.context.header.apiKey}")
       }
 
@@ -201,8 +209,50 @@ class ControllerApis(
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, deleteTopicsRequest.data.timeoutMs),
       controllerMutationQuotaRecorderFor(controllerMutationQuota))
+
+    // VC-aware delete:
+    //  1. If the principal is in a VC, translate any link names in the request to physical names.
+    //  2. Guard: any physical topic that is still linked in any VC must not be deleted.
+    val principal = request.context.principal.getName
+    val rewrittenData = deleteTopicsRequest.data.duplicate()
+
+    // Step 1 — translate link names → physical names for VC users (in topicNames list).
+    rewrittenData.topicNames().replaceAll(name => metadataCache.resolveTopicName(principal, name))
+    // Also translate in the structured topics list (v5+).
+    rewrittenData.topics().forEach { t =>
+      if (t.name() != null) t.setName(metadataCache.resolveTopicName(principal, t.name()))
+    }
+
+    // Step 2 — collect names that are VC-linked and must be blocked.
+    // Build a pre-response for blocked topics; the remaining names go to the normal path.
+    val blockedResponses = new util.ArrayList[DeletableTopicResult]()
+    val nameIterator = rewrittenData.topicNames().iterator()
+    while (nameIterator.hasNext) {
+      val physicalName = nameIterator.next()
+      if (metadataCache.isTopicLinkedInAnyVc(physicalName)) {
+        blockedResponses.add(new DeletableTopicResult()
+          .setName(physicalName)
+          .setErrorCode(TOPIC_DELETION_DISABLED.code)
+          .setErrorMessage(s"Topic '$physicalName' is linked to a virtual cluster and cannot be deleted."))
+        nameIterator.remove()
+      }
+    }
+    val topicIterator = rewrittenData.topics().iterator()
+    while (topicIterator.hasNext) {
+      val t = topicIterator.next()
+      val physicalName = t.name()
+      if (physicalName != null && metadataCache.isTopicLinkedInAnyVc(physicalName)) {
+        blockedResponses.add(new DeletableTopicResult()
+          .setName(physicalName)
+          .setTopicId(t.topicId())
+          .setErrorCode(TOPIC_DELETION_DISABLED.code)
+          .setErrorMessage(s"Topic '$physicalName' is linked to a virtual cluster and cannot be deleted."))
+        topicIterator.remove()
+      }
+    }
+
     val future = deleteTopics(context,
-      deleteTopicsRequest.data,
+      rewrittenData,
       request.context.apiVersion,
       authHelper.authorize(request.context, DELETE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
       names => authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC, names)(n => n),
@@ -211,8 +261,11 @@ class ControllerApis(
       val response = if (exception != null) {
         deleteTopicsRequest.getErrorResponse(exception)
       } else {
+        val allResults = new util.ArrayList[DeletableTopicResult]()
+        allResults.addAll(blockedResponses)
+        allResults.addAll(results)
         val responseData = new DeleteTopicsResponseData()
-          .setResponses(new DeletableTopicResultCollection(results.iterator))
+          .setResponses(new DeletableTopicResultCollection(allResults.iterator))
         new DeleteTopicsResponse(responseData)
       }
       requestHelper.sendResponseMaybeThrottleWithControllerQuota(controllerMutationQuota, request, response)
@@ -365,12 +418,73 @@ class ControllerApis(
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, createTopicsRequest.data.timeoutMs),
       controllerMutationQuotaRecorderFor(controllerMutationQuota))
-    val future = createTopics(context,
-        createTopicsRequest.data,
-        authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
-        names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),
-        names => authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
+
+    // VC-aware create: if the principal is a member of a virtual cluster, generate a physical
+    // name for each requested topic and register the link after successful creation.
+    val principal = request.context.principal.getName
+    val vcOpt: Option[VirtualClusterImage] = metadataCache.currentImage()
+      .virtualClusters()
+      .findVcForUser(principal)
+      .toScala
+
+    val future = vcOpt match {
+      case Some(vc) =>
+        // Build a link-name → physical-name mapping for every topic in the request.
+        // Physical name = "<UUID>.<linkName>" (unique, stable, hidden from VC clients).
+        val linkToPhysical: Map[String, String] = createTopicsRequest.data.topics().asScala
+          .map(t => t.name() -> (UUID.randomUUID().toString + "." + t.name()))
+          .toMap
+
+        // Rewrite topic names to physical names in a duplicate of the request data.
+        val rewrittenData = createTopicsRequest.data.duplicate()
+        rewrittenData.topics().forEach { t =>
+          linkToPhysical.get(t.name()).foreach(physical => t.setName(physical))
+        }
+
+        val innerFuture = createTopics(context,
+          rewrittenData,
+          authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
+          names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),
+          names => authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
             names, logIfDenied = false)(identity))
+
+        innerFuture.thenCompose { response =>
+          // For each successfully created topic, register the link in the VC.
+          val linkFutures: Seq[CompletableFuture[Void]] = response.topics().asScala
+            .filter(r => r.errorCode() == Errors.NONE.code())
+            .flatMap { r =>
+              // r.name() is the physical name; find the matching link name.
+              linkToPhysical.find { case (_, phys) => phys == r.name() }.map { case (linkName, physicalName) =>
+                val resource = new AlterVirtualClusterResource()
+                  .setResourceType(2.toByte) // TOPIC
+                  .setResourceName(physicalName)
+                  .setLinkName(linkName)
+                  .setOperation(0.toByte) // ADD
+                val alterData = new AlterableVirtualCluster()
+                  .setName(vc.name())
+                  .setResources(util.List.of(resource))
+                controller.alterVirtualCluster(context, alterData)
+              }
+            }.toSeq
+          CompletableFuture.allOf(linkFutures: _*).thenApply { _ =>
+            // Rewrite physical names back to link names in the response.
+            val physicalToLink: Map[String, String] = linkToPhysical.map { case (l, p) => p -> l }
+            response.topics().forEach { r =>
+              physicalToLink.get(r.name()).foreach(linkName => r.setName(linkName))
+            }
+            response
+          }
+        }
+
+      case None =>
+        createTopics(context,
+          createTopicsRequest.data,
+          authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
+          names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),
+          names => authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
+            names, logIfDenied = false)(identity))
+    }
+
     future.handle[Unit] { (result, exception) =>
       val response = if (exception != null) {
         createTopicsRequest.getErrorResponse(exception)
@@ -1101,5 +1215,143 @@ class ControllerApis(
   def handleUpdateRaftVoter(request: RequestChannel.Request): CompletableFuture[Unit] = {
     authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
     handleRaftRequest(request, response => new UpdateRaftVoterResponse(response.asInstanceOf[UpdateRaftVoterResponseData]))
+  }
+
+  private def handleCreateVirtualCluster(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val createRequest = request.body[CreateVirtualClusterRequest]
+    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
+      requestTimeoutMsToDeadlineNs(time, createRequest.data.timeoutMs))
+    val results = new java.util.ArrayList[CreateVirtualClusterResponseData.CreatableVirtualClusterResult]()
+    val futures = createRequest.data.virtualClusters().asScala.map { vc =>
+      val result = new CreateVirtualClusterResponseData.CreatableVirtualClusterResult().setName(vc.name())
+      results.add(result)
+      controller.createVirtualCluster(context, vc.name())
+        .handle[Unit] { (_, exception) =>
+          if (exception != null) {
+            val error = Errors.forException(exception)
+            result.setErrorCode(error.code()).setErrorMessage(exception.getMessage)
+          }
+        }
+    }
+    CompletableFuture.allOf(futures.toSeq: _*).handle[Unit] { (_, _) =>
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new CreateVirtualClusterResponse(
+          new CreateVirtualClusterResponseData()
+            .setThrottleTimeMs(requestThrottleMs)
+            .setVirtualClusters(results)))
+    }
+  }
+
+  private def handleDeleteVirtualCluster(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val deleteRequest = request.body[DeleteVirtualClusterRequest]
+    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
+      requestTimeoutMsToDeadlineNs(time, deleteRequest.data.timeoutMs))
+    val results = new java.util.ArrayList[DeleteVirtualClusterResponseData.DeletableVirtualClusterResult]()
+    val futures = deleteRequest.data.virtualClusters().asScala.map { vc =>
+      val result = new DeleteVirtualClusterResponseData.DeletableVirtualClusterResult().setName(vc.name())
+      results.add(result)
+      controller.deleteVirtualCluster(context, vc.name())
+        .handle[Unit] { (_, exception) =>
+          if (exception != null) {
+            val error = Errors.forException(exception)
+            result.setErrorCode(error.code()).setErrorMessage(exception.getMessage)
+          }
+        }
+    }
+    CompletableFuture.allOf(futures.toSeq: _*).handle[Unit] { (_, _) =>
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new DeleteVirtualClusterResponse(
+          new DeleteVirtualClusterResponseData()
+            .setThrottleTimeMs(requestThrottleMs)
+            .setVirtualClusters(results)))
+    }
+  }
+
+  private def handleAlterVirtualCluster(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val alterRequest = request.body[AlterVirtualClusterRequest]
+    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
+      requestTimeoutMsToDeadlineNs(time, alterRequest.data.timeoutMs))
+    val results = new java.util.ArrayList[AlterVirtualClusterResponseData.AlterableVirtualClusterResult]()
+    val futures = alterRequest.data.virtualClusters().asScala.map { vc =>
+      val result = new AlterVirtualClusterResponseData.AlterableVirtualClusterResult().setName(vc.name())
+      results.add(result)
+      controller.alterVirtualCluster(context, vc)
+        .handle[Unit] { (_, exception) =>
+          if (exception != null) {
+            val error = Errors.forException(exception)
+            result.setErrorCode(error.code()).setErrorMessage(exception.getMessage)
+          }
+        }
+    }
+    CompletableFuture.allOf(futures.toSeq: _*).handle[Unit] { (_, _) =>
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new AlterVirtualClusterResponse(
+          new AlterVirtualClusterResponseData()
+            .setThrottleTimeMs(requestThrottleMs)
+            .setVirtualClusters(results)))
+    }
+  }
+
+  private def handleListVirtualClusters(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val listVirtualClustersRequest = request.body[ListVirtualClustersRequest]
+    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
+      requestTimeoutMsToDeadlineNs(time, 60000))
+    controller.listVirtualClusters(context)
+      .handle[Unit] { (names, exception) =>
+        if (exception != null) {
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            listVirtualClustersRequest.getErrorResponse(requestThrottleMs, exception))
+        } else {
+          val vcList = new java.util.ArrayList[ListVirtualClustersResponseData.ListedVirtualCluster]()
+          names.forEach(name => vcList.add(new ListVirtualClustersResponseData.ListedVirtualCluster().setName(name)))
+          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+            new ListVirtualClustersResponse(
+              new ListVirtualClustersResponseData()
+                .setThrottleTimeMs(requestThrottleMs)
+                .setErrorCode(Errors.NONE.code())
+                .setErrorMessage(null)
+                .setVirtualClusters(vcList)))
+        }
+      }
+  }
+
+  private def handleDescribeVirtualCluster(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    val describeRequest = request.body[DescribeVirtualClusterRequest]
+    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
+      requestTimeoutMsToDeadlineNs(time, describeRequest.data.timeoutMs))
+    val results = new java.util.ArrayList[DescribeVirtualClusterResponseData.DescribedVirtualCluster]()
+    val futures = describeRequest.data.virtualClusters().asScala.map { vc =>
+      val described = new DescribeVirtualClusterResponseData.DescribedVirtualCluster().setName(vc.name())
+      results.add(described)
+      controller.describeVirtualCluster(context, vc.name())
+        .handle[Unit] { (record, exception) =>
+          if (exception != null) {
+            val error = Errors.forException(exception)
+            described.setErrorCode(error.code()).setErrorMessage(exception.getMessage)
+          } else {
+            val topicLinks = new java.util.ArrayList[DescribeVirtualClusterResponseData.DescribedVirtualClusterTopicLink]()
+            record.topics().forEach { t =>
+              topicLinks.add(new DescribeVirtualClusterResponseData.DescribedVirtualClusterTopicLink()
+                .setLinkName(t.linkName())
+                .setPhysicalName(t.topicName()))
+            }
+            described
+              .setErrorCode(Errors.NONE.code())
+              .setErrorMessage(null)
+              .setTopicLinks(topicLinks)
+              .setUsers(record.users())
+              .setClients(record.clients())
+              .setGroups(record.groups())
+              .setTransactionalIds(record.transactionalIds())
+          }
+        }
+    }
+    CompletableFuture.allOf(futures.toSeq: _*).handle[Unit] { (_, _) =>
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new DescribeVirtualClusterResponse(
+          new DescribeVirtualClusterResponseData()
+            .setThrottleTimeMs(requestThrottleMs)
+            .setVirtualClusters(results)))
+    }
   }
 }

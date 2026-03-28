@@ -5505,7 +5505,8 @@ class ReplicaManagerTest {
       ProducerIdsImage.EMPTY,
       AclsImage.EMPTY,
       ScramImage.EMPTY,
-      DelegationTokenImage.EMPTY
+      DelegationTokenImage.EMPTY,
+      VirtualClustersImage.EMPTY
     )
   }
 
